@@ -292,11 +292,3 @@ Permission is hereby granted, free of charge, to any person obtaining a copy...
 
 ## Changelog (high level)
 - 1.0.0 - Initial single-file implementation covering HTTP analysis, basic security checks, DNS/WHOIS, link checking, TLS probing, optional VT/Shodan/crt.sh, screenshots via Playwright, and SQLite history.
-
-## Contact / Support
-- If you'd like help integrating this into a repo, generating a `requirements.txt`, or adding CI (GitHub Actions), I can:
-  - Create the README file in your repo
-  - Add a minimal `requirements.txt`
-  - Add a basic GitHub Actions workflow for linting
-
-Enjoy — and remember to scan responsibly.
