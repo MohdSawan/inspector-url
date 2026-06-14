@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""
+enhanced_url_inspector.py
+
+A richer URL inspection/recon tool.
+
+Usage examples:
+  python enhanced_url_inspector.py example.com --pretty --deep --check-links --screenshot --save-db
+  python enhanced_url_inspector.py https://example.com --vt-api-key YOUR_VT_KEY --shodan-key YOUR_SHODAN_KEY
+
+Notes:
+ - Optional integrations (VirusTotal, Shodan) require API keys passed via args or environment variables.
+ - Screenshot requires Playwright installed and run once: `playwright install`.
+ - Database history stored in sqlite file url_inspector.db when --save-db used.
+"""
+
+from __future__ import annotations
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import socket
+import ssl
+import sqlite3
+import sys
+import time
+import traceback
+from collections import defaultdict
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+# Optional heavy deps — import when used.
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    import dns.resolver
+    import tldextract
+    import whois as pywhois
+    from cryptography import x509
+    from cryptography.hazmat.backends import default_backend
+except Exception as e:
+    print("Missing core dependencies. Run:\n  pip install requests beautifulsoup4 dnspython tldextract python-whois cryptography\n")
+    raise
+
+USER_AGENT = "Mozilla/5.0 (compatible; URL-Inspector/2.0; +https://example.com/bot)"
+COMMON_SECURITY_HEADERS = [
+    "strict-transport-security",
+    "content-security-policy",
+    "x-frame-options",
+    "x-content-type-options",
+    "referrer-policy",
+    "permissions-policy",
+    "expect-ct",
+    "feature-policy",
+]
+
+DB_FILE = "url_inspector.db"
+
+# ------------------------------
+# Utilities
+# ------------------------------
+def normalize_url(u: str) -> str:
+    u = u.strip()
+    if not u:
+        raise ValueError("Empty URL")
+    if not re.match(r"^https?://", u, re.I):
+        u = "http://" + u
+    return u
+
+def http_get(url: str, timeout: int = 8) -> Tuple[Optional[requests.Response], Optional[str]]:
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        text = None
+        ctype = r.headers.get("Content-Type", "")
+        if r.status_code == 200 and "text/html" in ctype:
+            text = r.text
+        return r, text
+    except Exception as e:
+        return None, None
+
+def head_request(url: str, timeout: int = 6) -> Tuple[str, Optional[int], Optional[str]]:
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        r = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+        return url, r.status_code, r.headers.get("Content-Type")
+    except Exception:
+        # fallback to GET
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout, stream=True)
+            return url, r.status_code, r.headers.get("Content-Type")
+        except Exception:
+            return url, None, None
+
+# ------------------------------
+# HTML parsing & fingerprinting
+# ------------------------------
+def parse_html_and_links(html: str, base_url: str) -> Dict:
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.string.strip() if soup.title and soup.title.string else None
+    meta_desc = None
+    m = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+    if m and m.get("content"):
+        meta_desc = m["content"].strip()
+    # generator meta often shows CMS
+    meta_gen = None
+    mg = soup.find("meta", attrs={"name": re.compile(r"generator", re.I)})
+    if mg and mg.get("content"):
+        meta_gen = mg["content"].strip()
+    links = []
+    for a in soup.find_all("a", href=True):
+        links.append(a["href"].strip())
+    scripts = [s.get("src") for s in soup.find_all("script", src=True)]
+    link_objs = classify_links(links, base_url)
+    return {
+        "title": title,
+        "meta_description": meta_desc,
+        "meta_generator": meta_gen,
+        "links": links,
+        "scripts": [s for s in scripts if s],
+        "internal_links_sample": link_objs["internal"][:8],
+        "external_links_sample": link_objs["external"][:8],
+        "num_links": len(link_objs["internal"]) + len(link_objs["external"]),
+    }
+
+def classify_links(links: List[str], base_url: str) -> Dict[str, List[str]]:
+    extracted = tldextract.extract(base_url)
+    base_domain = extracted.registered_domain
+    internal = []
+    external = []
+    for href in links:
+        if href.startswith("#") or href.startswith("mailto:") or href.startswith("javascript:"):
+            continue
+        if href.startswith("//"):
+            href_full = "http:" + href
+        elif href.startswith("http://") or href.startswith("https://"):
+            href_full = href
+        else:
+            href_full = href
+        ext = tldextract.extract(href_full)
+        if ext.registered_domain and base_domain and ext.registered_domain != base_domain:
+            external.append(href_full)
+        else:
+            internal.append(href_full)
+    return {"internal": internal, "external": external}
+
+# Simple fingerprinting heuristics for common CMS/frameworks
+def fingerprint_frameworks(headers: Dict[str, str], html: Optional[str], url: str) -> List[str]:
+    tags = []
+    # headers
+    server = headers.get("Server") or headers.get("server") or ""
+    if "nginx" in server.lower():
+        tags.append("nginx")
+    if "cloudflare" in server.lower():
+        tags.append("cloudflare")
+    if "apache" in server.lower():
+        tags.append("apache")
+    # html heuristics
+    h = (html or "").lower()
+    if "wp-content" in h or "wp-emoji-release.min.js" in h or "wordpress" in h:
+        tags.append("wordpress")
+    if "drupal" in h or "/sites/default/" in h:
+        tags.append("drupal")
+    if "joomla" in h or "joomla" in h:
+        tags.append("joomla")
+    if "next-data" in h or "_next" in h:
+        tags.append("next.js")
+    if "react" in h or "data-reactroot" in h:
+        tags.append("react")
+    if "angular" in h or "ng-app" in h:
+        tags.append("angular")
+    # common filenames
+    try:
+        parsed = requests.utils.urlparse(url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        # quick path checks (not blocking)
+        robots = requests.get(base + "/robots.txt", headers={"User-Agent": USER_AGENT}, timeout=4)
+        if robots.status_code == 200 and "wp-content" in robots.text:
+            tags.append("wordpress")
+    except Exception:
+        pass
+    return sorted(set(tags))
+
+# ------------------------------
+# Security header & cookie analysis
+# ------------------------------
+def check_security_headers(headers: Dict[str, str]) -> Dict[str, Optional[str]]:
+    found = {}
+    lheaders = {k.lower(): v for k, v in headers.items()}
+    for h in COMMON_SECURITY_HEADERS:
+        found[h] = lheaders.get(h)
+    # cookies: might be multiple Set-Cookie headers
+    sc = []
+    for k, v in headers.items():
+        if k.lower() == "set-cookie":
+            sc.append(v)
+    # requests may merge multiple Set-Cookie into a single header separated by commas (not ideal).
+    found["set_cookie_raw"] = sc if sc else headers.get("Set-Cookie") or headers.get("set-cookie")
+    found["cookie_flags"] = analyze_cookies(sc if sc else [])
+    return found
+
+def analyze_cookies(set_cookie_headers: List[str]) -> List[Dict]:
+    out = []
+    for val in set_cookie_headers:
+        # split on ';' -> name=..., attributes
+        parts = [p.strip() for p in val.split(";")]
+        if not parts:
+            continue
+        name_pair = parts[0]
+        attributes = {p.lower(): True for p in parts[1:]}
+        secure = "secure" in attributes
+        httponly = "httponly" in attributes
+        samesite = None
+        for a in parts[1:]:
+            if a.strip().lower().startswith("samesite="):
+                samesite = a.split("=", 1)[1]
+        out.append({
+            "cookie": name_pair,
+            "secure": secure,
+            "httponly": httponly,
+            "samesite": samesite,
+            "attrs": attributes,
+        })
+    return out
+
+def evaluate_csp(csp_value: Optional[str]) -> List[str]:
+    issues = []
+    if not csp_value:
+        return []
+    v = csp_value.lower()
+    if "'unsafe-inline'" in v or "unsafe-inline" in v:
+        issues.append("CSP allows 'unsafe-inline' which weakens protections against XSS.")
+    if "*" in v:
+        issues.append("CSP contains wildcard '*' source which is permissive.")
+    if "data:" in v:
+        issues.append("CSP allows data: sources which can allow inline content.")
+    return issues
+
+# ------------------------------
+# TLS probing
+# ------------------------------
+def get_cert_info(hostname: str, port: int = 443, timeout: int = 8) -> Optional[Dict]:
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((hostname, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                der = ssock.getpeercert(True)
+                pem = ssl.DER_cert_to_PEM_cert(der)
+        cert = x509.load_pem_x509_certificate(pem.encode(), default_backend())
+        subj = {attr.oid._name: attr.value for attr in cert.subject}
+        issuer = {attr.oid._name: attr.value for attr in cert.issuer}
+        san = []
+        try:
+            ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            san = ext.value.get_values_for_type(x509.DNSName)
+        except Exception:
+            san = []
+        return {
+            "subject": subj,
+            "issuer": issuer,
+            "not_before": str(cert.not_valid_before),
+            "not_after": str(cert.not_valid_after),
+            "san": san,
+            "serial_number": hex(cert.serial_number),
+            "sig_alg": getattr(cert, "signature_algorithm_oid", None)._name if getattr(cert, "signature_algorithm_oid", None) else None,
+        }
+    except Exception:
+        return None
+
+# Test TLS protocol support (best-effort)
+def test_tls_versions(hostname: str, port: int = 443, timeout: int = 4) -> Dict[str, bool]:
+    versions = {}
+    # Use ssl.TLSVersion if available (py3.7+)
+    support_map = {
+        "TLSv1": getattr(ssl, "PROTOCOL_TLSv1", None),
+        "TLSv1_1": getattr(ssl, "PROTOCOL_TLSv1_1", None),
+        "TLSv1_2": getattr(ssl, "PROTOCOL_TLSv1_2", None),
+    }
+    # TLSv1_3 not available via PROTOCOL_* constants; use minimum_version trick if possible
+    for name, proto in support_map.items():
+        if proto is None:
+            versions[name] = False
+            continue
+        try:
+            ctx = ssl.SSLContext(proto)
+            ctx.set_ciphers("DEFAULT")
+            with socket.create_connection((hostname, port), timeout=timeout) as sock:
+                with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    versions[name] = True
+        except Exception:
+            versions[name] = False
+    # Try TLS 1.3 via minimum_version if available
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        if hasattr(ssl, "TLSVersion"):
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+            try:
+                with socket.create_connection((hostname, port), timeout=timeout) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                        versions["TLSv1_3"] = True
+            except Exception:
+                versions["TLSv1_3"] = False
+        else:
+            versions["TLSv1_3"] = False
+    except Exception:
+        versions["TLSv1_3"] = False
+    return versions
+
+# ------------------------------
+# DNS, WHOIS, ip geo, crt.sh, VT, Shodan
+# ------------------------------
+def dns_lookup(domain: str) -> Dict:
+    resolver = dns.resolver.Resolver()
+    out = {"A": [], "AAAA": [], "MX": [], "NS": [], "TXT": []}
+    try:
+        for r in resolver.resolve(domain, "A", lifetime=5):
+            out["A"].append(r.to_text())
+    except Exception:
+        pass
+    try:
+        for r in resolver.resolve(domain, "AAAA", lifetime=5):
+            out["AAAA"].append(r.to_text())
+    except Exception:
+        pass
+    try:
+        for r in resolver.resolve(domain, "MX", lifetime=5):
+            out["MX"].append(r.to_text())
+    except Exception:
+        pass
+    try:
+        for r in resolver.resolve(domain, "NS", lifetime=5):
+            out["NS"].append(r.to_text())
+    except Exception:
+        pass
+    try:
+        for r in resolver.resolve(domain, "TXT", lifetime=5):
+            # r.strings may be bytes
+            vals = []
+            for s in r.strings:
+                vals.append(s.decode() if isinstance(s, bytes) else str(s))
+            out["TXT"].append(" ".join(vals))
+    except Exception:
+        pass
+    return out
+
+def do_whois(domain: str) -> Dict:
+    try:
+        w = pywhois.whois(domain)
+        raw = str(getattr(w, "text", "") or "")
+        registrar = getattr(w, "registrar", None)
+        creation = getattr(w, "creation_date", None)
+        expiration = getattr(w, "expiration_date", None)
+        emails = getattr(w, "emails", None) or []
+        if isinstance(emails, str):
+            emails = [emails]
+        return {"raw": raw, "registrar": registrar, "creation": str(creation), "expiration": str(expiration), "emails": emails}
+    except Exception:
+        return {"raw": None, "registrar": None, "creation": None, "expiration": None, "emails": []}
+
+def ip_geolocation(ip: str) -> Optional[Dict]:
+    try:
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,regionName,city,isp,org,as,query", timeout=6, headers={"User-Agent": USER_AGENT})
+        if r.status_code == 200:
+            j = r.json()
+            if j.get("status") == "success":
+                return j
+    except Exception:
+        pass
+    return None
+
+def crtsh_lookup(domain: str, timeout: int = 8) -> Optional[List[Dict]]:
+    try:
+        url = f"https://crt.sh/?q=%25{domain}&output=json"
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except Exception:
+                return None
+    except Exception:
+        pass
+    return None
+
+def virustotal_domain_lookup(domain: str, api_key: str, timeout: int = 8) -> Optional[Dict]:
+    if not api_key:
+        return None
+    try:
+        headers = {"x-apikey": api_key}
+        # Use VT v3 domain/report-like endpoints: domain reports require API specifics; we'll hit /domains/{domain}
+        url = f"https://www.virustotal.com/api/v3/domains/{domain}"
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+def shodan_host_lookup(ip: str, api_key: str, timeout: int = 8) -> Optional[Dict]:
+    if not api_key:
+        return None
+    try:
+        url = f"https://api.shodan.io/shodan/host/{ip}?key={api_key}"
+        r = requests.get(url, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+# ------------------------------
+# Link checking (concurrent)
+# ------------------------------
+def check_links(links: List[str], concurrency: int = 10, timeout: int = 6) -> Dict[str, Dict]:
+    results = {}
+    # normalize relative URLs by skipping them (or we could join to base)
+    to_check = [l for l in links if l.startswith("http://") or l.startswith("https://") or l.startswith("//")]
+    # normalize // to http://
+    to_check = [("http:" + l) if l.startswith("//") else l for l in to_check]
+    if not to_check:
+        return results
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futures = {ex.submit(head_request, l, timeout): l for l in to_check}
+        for fut in concurrent.futures.as_completed(futures):
+            l = futures[fut]
+            try:
+                url, status, ctype = fut.result()
+                results[l] = {"status": status, "content_type": ctype}
+            except Exception as e:
+                results[l] = {"status": None, "error": str(e)}
+    return results
+
+# ------------------------------
+# Screenshot (optional: Playwright)
+# ------------------------------
+def take_screenshot(url: str, out_path: str = "screenshot.png", timeout: int = 15) -> Optional[str]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 800}, user_agent=USER_AGENT)
+            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            page.screenshot(path=out_path, full_page=True)
+            browser.close()
+        return out_path
+    except Exception:
+        return None
+
+# ------------------------------
+# Database history (SQLite)
+# ------------------------------
+def init_db(db_file: str = DB_FILE):
+    conn = sqlite3.connect(db_file)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS scans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target TEXT,
+        timestamp TEXT,
+        report_json TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_scan_to_db(target: str, report: dict, db_file: str = DB_FILE):
+    init_db(db_file)
+    conn = sqlite3.connect(db_file)
+    cur = conn.cursor()
+    cur.execute("INSERT INTO scans (target, timestamp, report_json) VALUES (?, ?, ?)", (target, datetime.utcnow().isoformat(), json.dumps(report)))
+    conn.commit()
+    conn.close()
+
+def get_history(target: str, db_file: str = DB_FILE, limit: int = 20) -> List[Dict]:
+    if not os.path.exists(db_file):
+        return []
+    conn = sqlite3.connect(db_file)
+    cur = conn.cursor()
+    cur.execute("SELECT id, timestamp, report_json FROM scans WHERE target = ? ORDER BY id DESC LIMIT ?", (target, limit))
+    rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({"id": r[0], "timestamp": r[1], "report": json.loads(r[2])})
+    conn.close()
+    return out
+
+# ------------------------------
+# Suggestions & heuristics
+# ------------------------------
+def generate_suggestions(report: Dict) -> List[str]:
+    s = []
+    headers = {k.lower(): v for k, v in (report.get("http", {}).get("headers") or {}).items()}
+    security_headers = report.get("security_headers", {})
+    # Security headers missing
+    missing = [h for h in COMMON_SECURITY_HEADERS if not security_headers.get(h)]
+    if missing:
+        s.append(f"Missing common security headers: {', '.join(missing)}.")
+    # CSP issues
+    csp = security_headers.get("content-security-policy")
+    csp_issues = evaluate_csp(csp)
+    s.extend(csp_issues)
+    # Cookies
+    cookies = security_headers.get("cookie_flags") or []
+    for c in cookies:
+        if not c.get("secure"):
+            s.append(f"Cookie not Secure: {c.get('cookie')}")
+        if not c.get("httponly"):
+            s.append(f"Cookie not HttpOnly: {c.get('cookie')}")
+    # TLS expiry
+    cert = report.get("cert")
+    if cert and cert.get("not_after"):
+        try:
+            na = datetime.fromisoformat(cert["not_after"])
+            days_left = (na - datetime.utcnow()).days
+            if days_left < 30:
+                s.append(f"TLS certificate expires in ~{days_left} days; renew soon.")
+        except Exception:
+            pass
+    else:
+        if report.get("http", {}).get("final_url", "").startswith("https"):
+            s.append("Unable to obtain TLS certificate details.")
+    # robots / sitemap
+    if not report.get("http", {}).get("robots_txt"):
+        s.append("No robots.txt at root; consider adding to control crawlers.")
+    if not report.get("http", {}).get("sitemap_xml"):
+        s.append("No sitemap.xml at root; consider adding for SEO.")
+    # link issues
+    broken = []
+    for u, res in (report.get("link_checks") or {}).items():
+        if res.get("status") is None or (res.get("status") and res["status"] >= 400):
+            broken.append(f"{u} -> {res.get('status')}")
+    if broken:
+        s.append(f"Broken/outgoing link issues found: {len(broken)} examples: {broken[:5]}")
+    # framework suggestions
+    fps = report.get("fingerprints") or []
+    if "wordpress" in fps:
+        s.append("Site appears to be WordPress — ensure plugins/themes are up-to-date and remove unused plugins.")
+    if report.get("open_ports"):
+        open_ports = [p for p, val in (report.get("open_ports") or {}).items() if val]
+        if open_ports:
+            s.append(f"Open ports detected: {', '.join(open_ports)}; verify they're intended and access-controlled.")
+    # default
+    if report.get("http", {}).get("status_code", 0) and 200 <= report["http"]["status_code"] < 300:
+        s.append("Site returns 2xx — baseline reachable.")
+    else:
+        s.append("Site returned non-2xx status or unreachable; check server configuration and redirects.")
+    return s
+
+# ------------------------------
+# Main inspection orchestration
+# ------------------------------
+def inspect_target(target: str, deep: bool = False, check_links_flag: bool = False, concurrency: int = 10,
+                   link_timeout: int = 6, vt_api_key: Optional[str] = None, shodan_key: Optional[str] = None,
+                   crtsh_flag: bool = False, screenshot_flag: bool = False, screenshot_out: str = "screenshot.png",
+                   ports: List[int] = [80, 443], timeout: int = 8, save_db: bool = False) -> Dict:
+    checked_at = datetime.utcnow().isoformat()
+    url = normalize_url(target)
+    http_resp, html = http_get(url, timeout=timeout)
+    http_info = {}
+    if http_resp:
+        http_info = {
+            "url": target,
+            "final_url": http_resp.url,
+            "status_code": http_resp.status_code,
+            "headers": dict(http_resp.headers),
+        }
+        if html:
+            parsed = parse_html_and_links(html, http_resp.url)
+            http_info.update(parsed)
+        else:
+            http_info.update({"title": None, "meta_description": None, "links": [], "scripts": [], "internal_links_sample": [], "external_links_sample": [], "num_links": 0})
+        # robots/sitemap
+        try:
+            parsed_u = requests.utils.urlparse(http_resp.url)
+            base = f"{parsed_u.scheme}://{parsed_u.netloc}"
+            r = requests.get(base + "/robots.txt", headers={"User-Agent": USER_AGENT}, timeout=4)
+            http_info["robots_txt"] = r.text[:20000] if r.status_code == 200 else None
+        except Exception:
+            http_info["robots_txt"] = None
+        try:
+            s = requests.get(base + "/sitemap.xml", headers={"User-Agent": USER_AGENT}, timeout=4)
+            http_info["sitemap_xml"] = s.text[:20000] if s.status_code == 200 and "xml" in (s.headers.get("Content-Type") or "") else None
+        except Exception:
+            http_info["sitemap_xml"] = None
+    else:
+        http_info = {"url": target, "final_url": None, "status_code": None, "headers": {}, "title": None, "meta_description": None, "links": [], "scripts": [], "num_links": 0, "robots_txt": None, "sitemap_xml": None}
+
+    # Domain / DNS / IP
+    extracted = tldextract.extract(url)
+    domain = extracted.registered_domain or (extracted.domain + "." + extracted.suffix)
+    dns_info = dns_lookup(domain)
+    ip = None
+    if dns_info.get("A"):
+        ip = dns_info["A"][0]
+    else:
+        try:
+            host = requests.utils.urlparse(http_info.get("final_url") or url).hostname
+            ip = socket.gethostbyname(host)
+        except Exception:
+            ip = None
+
+    cert = None
+    if http_info.get("final_url") and http_info.get("final_url").startswith("https"):
+        host_for_cert = requests.utils.urlparse(http_info.get("final_url")).hostname
+        cert = get_cert_info(host_for_cert, 443, timeout=timeout)
+
+    # TLS versions
+    tls_versions = {}
+    if ip and http_info.get("final_url", "").startswith("https"):
+        host_for_tls = requests.utils.urlparse(http_info.get("final_url")).hostname
+        tls_versions = test_tls_versions(host_for_tls)
+
+    # fingerprints
+    fps = fingerprint_frameworks(http_info.get("headers", {}), html, http_info.get("final_url") or url)
+
+    # optional deep lookups
+    whois_info = None
+    geo = None
+    open_ports = None
+    vt_info = None
+    shodan_info = None
+    crtsh_info = None
+    if deep:
+        whois_info = do_whois(domain)
+        if ip:
+            geo = ip_geolocation(ip)
+            # quick port check
+            open_ports = {}
+            for p in ports:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.2)
+                try:
+                    s.connect((ip, p))
+                    open_ports[str(p)] = True
+                except Exception:
+                    open_ports[str(p)] = False
+                finally:
+                    s.close()
+        if vt_api_key:
+            vt_info = virustotal_domain_lookup(domain, vt_api_key)
+        if shodan_key and ip:
+            shodan_info = shodan_host_lookup(ip, shodan_key)
+        if crtsh_flag:
+            crtsh_info = crtsh_lookup(domain)
+
+    # link checks
+    link_checks = None
+    if check_links_flag:
+        all_links = list(set(http_info.get("links", []) + http_info.get("external_links_sample", [])))
+        link_checks = check_links(all_links, concurrency=concurrency, timeout=link_timeout)
+
+    security_headers = check_security_headers(http_info.get("headers", {}))
+
+    report = {
+        "target": target,
+        "checked_at": checked_at,
+        "http": http_info,
+        "cert": cert,
+        "tls_versions": tls_versions,
+        "dns": dns_info,
+        "ip": ip,
+        "geo": geo,
+        "whois": whois_info,
+        "open_ports": open_ports,
+        "fingerprints": fps,
+        "security_headers": security_headers,
+        "link_checks": link_checks,
+        "vt": vt_info,
+        "shodan": shodan_info,
+        "crtsh": crtsh_info,
+    }
+
+    report["suggestions"] = generate_suggestions(report)
+
+    # screenshot
+    screenshot_path = None
+    if screenshot_flag:
+        sp = take_screenshot(http_info.get("final_url") or url, out_path=screenshot_out)
+        report["screenshot"] = sp
+
+    # Save to DB if requested
+    if save_db:
+        try:
+            save_scan_to_db(target, report)
+        except Exception:
+            pass
+
+    return report
+
+# ------------------------------
+# Printing helpers
+# ------------------------------
+def print_pretty(report: Dict):
+    print("=" * 96)
+    print(f"Target: {report.get('target')}")
+    print(f"Checked at (UTC): {report.get('checked_at')}")
+    print("-" * 96)
+    http = report.get("http", {})
+    print(f"Final URL: {http.get('final_url')}")
+    print(f"Status: {http.get('status_code')}")
+    print(f"Title: {http.get('title')}")
+    print(f"Meta description: {http.get('meta_description')}")
+    print(f"Links found: {http.get('num_links')}")
+    print("-" * 96)
+    print("Security headers:")
+    for k, v in (report.get("security_headers") or {}).items():
+        if k == "cookie_flags":
+            continue
+        print(f"  {k}: {v}")
+    print("Cookie flags:")
+    for c in (report.get("security_headers") or {}).get("cookie_flags") or []:
+        print(f"  {c}")
+    print("-" * 96)
+    print("TLS / cert:")
+    if report.get("cert"):
+        c = report["cert"]
+        print(f"  Subject: {c.get('subject')}")
+        print(f"  Issuer: {c.get('issuer')}")
+        print(f"  Valid: {c.get('not_before')} -> {c.get('not_after')}")
+        print(f"  SANs: {c.get('san')}")
+    print(f"  TLS versions supported: {report.get('tls_versions')}")
+    print("-" * 96)
+    print("DNS records:")
+    for k, v in (report.get("dns") or {}).items():
+        print(f"  {k}: {v}")
+    print(f"Resolved IP: {report.get('ip')}")
+    if report.get("geo"):
+        print(f"Geo: {report.get('geo')}")
+    print("-" * 96)
+    if report.get("fingerprints"):
+        print("Fingerprints / frameworks: " + ", ".join(report.get("fingerprints")))
+    if report.get("open_ports"):
+        print("Open ports (deep):")
+        for p, v in report["open_ports"].items():
+            print(f"  {p}: {'open' if v else 'closed'}")
+    if report.get("link_checks"):
+        total = len(report["link_checks"])
+        bad = sum(1 for v in report["link_checks"].values() if (v.get("status") is None or (isinstance(v.get("status"), int) and v["status"] >= 400)))
+        print(f"Link checks: {total} links checked, {bad} problematic")
+    print("-" * 96)
+    print("Suggestions:")
+    for s in report.get("suggestions", []):
+        print(" - " + s)
+    print("=" * 96)
+
+# ------------------------------
+# CLI
+# ------------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Enhanced URL inspector (recon + security hints + optional integrations)")
+    p.add_argument("target", help="URL or domain to inspect")
+    p.add_argument("--deep", action="store_true", help="Enable WHOIS, geo, open ports, and optional VT/Shodan/crtsh lookups")
+    p.add_argument("--check-links", action="store_true", help="Check external links found on page")
+    p.add_argument("--concurrency", type=int, default=10, help="Concurrency for link checks")
+    p.add_argument("--link-timeout", type=int, default=6, help="Timeout for link HEAD requests")
+    p.add_argument("--vt-api-key", default=os.environ.get("VT_API_KEY"), help="VirusTotal API key (optional)")
+    p.add_argument("--shodan-key", default=os.environ.get("SHODAN_KEY"), help="Shodan API key (optional)")
+    p.add_argument("--crtsh", action="store_true", help="Query crt.sh for certificate transparency entries (no key required)")
+    p.add_argument("--screenshot", action="store_true", help="Take a screenshot of the page (Playwright required)")
+    p.add_argument("--screenshot-out", default="screenshot.png", help="Screenshot output path")
+    p.add_argument("--ports", default="80,443", help="Comma-separated ports for quick port checks during deep scan")
+    p.add_argument("--timeout", type=int, default=8, help="HTTP timeout")
+    p.add_argument("--pretty", action="store_true", help="Print human-friendly summary in addition to JSON")
+    p.add_argument("--save-db", action="store_true", help="Save scan report to local sqlite database")
+    p.add_argument("--check-crtsh-only", action="store_true", help="Only run crt.sh lookup and exit (helper)")
+    return p.parse_args()
+
+def main(argv=None):
+    args = parse_args()
+    ports = [int(p.strip()) for p in args.ports.split(",") if p.strip().isdigit()]
+    try:
+        if args.check_crtsh_only:
+            extracted = tldextract.extract(args.target)
+            domain = extracted.registered_domain or (extracted.domain + "." + extracted.suffix)
+            res = crtsh_lookup(domain)
+            print(json.dumps(res or [], indent=2, ensure_ascii=False))
+            return
+        report = inspect_target(args.target, deep=args.deep, check_links_flag=args.check_links, concurrency=args.concurrency,
+                                link_timeout=args.link_timeout, vt_api_key=args.vt_api_key, shodan_key=args.shodan_key,
+                                crtsh_flag=args.crtsh, screenshot_flag=args.screenshot, screenshot_out=args.screenshot_out,
+                                ports=ports, timeout=args.timeout, save_db=args.save_db)
+    except Exception:
+        print("Error during inspection:", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
+    if args.pretty:
+        print_pretty(report)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    if args.save_db:
+        print(f"Wrote scan to {DB_FILE}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()
